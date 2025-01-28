@@ -3,6 +3,7 @@ import argparse
 import re
 import time
 import sys
+import json
 
 from dms_collector import DmsCollector, TBML_VERSIONS
 
@@ -41,7 +42,7 @@ required.add_argument('--url', required=True,
                       help='Weblogic admin server url where DMS Spy is running', metavar='<url>')
 required.add_argument('--connect', required=True,
                       help='username/password to login to DMS Spy', metavar='<u/p>')
-required.add_argument('-t','--table', help='name of a valid DMS table which data to be retrieved', required=True,
+required.add_argument('-t','--table', help='name(s) of a valid DMS table(s) which data to be retrieved', required=True,
                       default=None, metavar='<tablename>')
 
 group1 = parser.add_argument_group('optional count and delay arguments')
@@ -63,8 +64,10 @@ fiopts.add_argument("-in", '--include', required=False,
                     help='list of header fiedls to be included in the output (all fields are included by default)', default='', metavar='<field1,field2,...>')
 
 foopts = parser.add_argument_group('optional formatting arguments')
+foopts.add_argument('--format', required=False, choices=['csv', 'json'], 
+                     default='csv', help='Output format: csv or json (default: csv)')
 foopts.add_argument('--csvdelimiter', required=False,
-                    default=",", metavar='<char>', help='CSV delimiter')
+                    default=",", metavar='<char>', help='CSV delimiter (only relevant for csv output)')
 foopts.add_argument('--noheader', required=False,
                     help='suppress header in the output', default=False, action='store_true')
 foopts.add_argument('--origheader', required=False,
@@ -130,21 +133,33 @@ try:
             preserve_orig_header=args.origheader
         )
 
-        if not args.noheader and not header_printed:
-            header_printed = True
-            fields = [x for x in table["data"][0].keys()]
-            fields.insert(0, args.datetimefield)
-            fields.insert(1, args.timezonefield)
-            sys.stdout.write(','.join(x for x in fields) + "\n")
-            sys.stdout.flush()
+        table_list = [x.strip() for x in args.table.split(',') if args.table.split(',') != '']
+        if args.format == 'csv':
+            for table_name in table_list:
+                # Allow skipping printing header only if 1 table is given.
+                if (not args.noheader and not header_printed) or len(table_list) > 1:
+                    header_printed = True
+                    fields = [x for x in table["data"][table_name][0].keys()]
+                    fields.insert(0, args.datetimefield)
+                    fields.insert(1, args.timezonefield)
+                    sys.stdout.write(','.join(x for x in fields) + "\n")
+                    sys.stdout.flush()
 
-        for row in table["data"]:
-            r = args.csvdelimiter.join([str(strinquotes(x))
-                                        for x in [stime, tzone] + [x for x in row.values()]])
+                for row in table["data"][table_name]:
+                    r = args.csvdelimiter.join([str(strinquotes(x))
+                                                for x in [stime, tzone] + [x for x in row.values()]])
 
-            if len(r) > 0:
-                sys.stdout.write(r + "\n")
-                sys.stdout.flush()
+                    if len(r) > 0:
+                        sys.stdout.write(r + "\n")
+                        sys.stdout.flush()
+        elif args.format == 'json':
+            for table_name in table_list:
+                table["data"][table_name][0][args.datetimefield] = stime
+                table["data"][table_name][0][args.timezonefield] = tzone
+
+                # Flatten the structure
+                table["data"][table_name] = table["data"][table_name][0]
+            json.dump(table["data"], sys.stdout, indent=4)
 
         if count < args.count:
             elapsed_s = time.time() - time_s

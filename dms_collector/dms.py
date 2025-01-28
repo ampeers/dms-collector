@@ -16,8 +16,8 @@ TBML_VERSIONS = ["11.0"]
 
 # DMS REQESTS URLs
 # before changing the urls below check their param bindings as per their usage
-DMSREQUEST_HEADER = "%s/dms/Spy?format=xml&table=%s&description=true&value=false"
-DMSREQUEST_DATA = "%s/dms/Spy?format=xml&table=%s&value=true&cached=false"
+DMSREQUEST_HEADER = "%s/dms/Spy?format=xml%s&description=true&value=false"
+DMSREQUEST_DATA = "%s/dms/Spy?format=xml%s&value=true&cached=false"
 DMSLOGIN_URL = "%s/dms/j_security_check"
 
 # timeout to read data from dms spy
@@ -107,6 +107,14 @@ def cleanhtml(html_string):
     return re.sub(CLEANR, '', html_string)
 
 
+def generate_dms_request_url(base_url, admin_url, tables):
+    '''
+    Splits the comma-separated tables list and create url with table query parameters for given admin url.
+    '''
+    table_params = ''.join([f"&table={table.strip()}" for table in tables.split(',') if tables.split(',') != ''])
+    return base_url % (admin_url, table_params)
+
+
 class DmsCollector():
     '''
     The main DMS collector class that allows to retrieve a DMS table from DMS Spy application.
@@ -185,8 +193,11 @@ class DmsCollector():
         '''
         Retrieves a DMS table header. If the table does not exist then it raises an error.
         '''
+        table_list = [x.strip() for x in table.split(',') if table.split(',') != '']
+
         if table not in self.header_cache:
-            # try to retrieve the table from the file cache and write to the file cache if enabled
+            # Try to retrieve the table from the file cache and write to the file cache if enabled.
+            # Cache is based on whole table list
             root = None
             table_file = self.table_file(table)
             if table_file is not None and os.path.exists(table_file):
@@ -194,23 +205,25 @@ class DmsCollector():
                     lines = r.readlines()
                 root = ET.fromstring("\n".join(lines))
             if root is None:
-                root, xmlstring = self.retrieve_data(DMSREQUEST_HEADER % (
-                    self.admin_url, table), check_tbl_version=check_tbl_version)
+                url = generate_dms_request_url(DMSREQUEST_HEADER, self.admin_url, table)
+                root, xmlstring = self.retrieve_data(url, check_tbl_version=check_tbl_version)
                 if table_file is not None and self.store_to_cache:
                     with open(table_file, "w") as w:
                         w.writelines(xmlstring)
 
-            te = root.find("./table")
-            if te is None or te.get("name") != table:
-                raise Exception(f"The table '{table}' does not exist!")
-            cdef = root.findall(".//columndef")
-            items = {}
-            for x in cdef:
-                d = x.find("description")
-                items[x.get("name")] = cleanhtml(
-                    d.text).strip() if d is not None else "n/a"
-            self.header_cache[table] = items
-        return self.header_cache[table]
+            for tab in table_list: 
+                te = root.find("./table[@name='%s']" % tab)
+                if te is None or te.get("name") not in table_list:
+                   raise Exception("The table '%s' does not exist!" % tab)
+                cdef = root.findall("./table[@name='%s']/columndef" % tab)
+                items = {}
+                for x in cdef:
+                    d = x.find("description")
+                    items[x.get("name")] = cleanhtml(
+                        d.text).strip() if d is not None else "n/a"
+                self.header_cache[tab] = items
+        return self.header_cache
+
 
     def collect(self, table, check_tbl_version=True, preserve_orig_header=False, include=[], exclude=[], filter=None):
         '''
@@ -221,41 +234,46 @@ class DmsCollector():
         '''
         start_time = time.time()
 
-        header = self.get_header(table, check_tbl_version)
-        root, _ = self.retrieve_data(DMSREQUEST_DATA % (
-            self.admin_url, table), check_tbl_version=check_tbl_version)
+        table_list = [x.strip() for x in table.split(',') if table.split(',') != '']
 
-        rows = []
-        for rw in root.findall(".//row"):
-            row = {}
-            for key in header.keys():
-                nkey = normalize(
-                    key, preserve_orig_header=preserve_orig_header)
-                if (nkey not in exclude and len(include) == 0) or nkey in include:
-                    cv = rw.find("./column[@name='%s']" % key)
-                    if cv is not None and cv.text is not None:
-                        if cv.text.strip() != '':
-                            row[nkey] = int_or_float_or_str(cv.text.strip())
+        header = self.get_header(table, check_tbl_version)
+        url = generate_dms_request_url(DMSREQUEST_DATA, self.admin_url, table)
+        root, _ = self.retrieve_data(url, check_tbl_version=check_tbl_version)
+
+        table_rows = {}
+        for tab in table_list:
+            rows = []
+            for rw in root.findall("./table[@name='%s']/row" % tab):
+                row = {}
+                for key in header['%s' % tab].keys():
+                    nkey = normalize(
+                        key, preserve_orig_header=preserve_orig_header)
+                    if (nkey not in exclude and len(include) == 0) or nkey in include:
+                        cv = rw.find("./column[@name='%s']" % key)
+                        if cv is not None and cv.text is not None:
+                            if cv.text.strip() != '':
+                                row[nkey] = int_or_float_or_str(cv.text.strip())
+                            else:
+                                row[nkey] = None
                         else:
                             row[nkey] = None
-                    else:
-                        row[nkey] = None
 
-            output_row = True
-            if filter is not None and filter.strip() != '':
-                tags, fields = get_tags_fields(row)
-                output_row = eval_filter(filter, tags, fields)
+                output_row = True
+                if filter is not None and filter.strip() != '':
+                    tags, fields = get_tags_fields(row)
+                    output_row = eval_filter(filter, tags, fields)
 
-            if output_row is True:
-                rows.append(row)
+                if output_row is True:
+                    rows.append(row)
+            table_rows[tab] = rows
 
         return {
             "time": time.time(),
             "table": table,
-            "url": DMSREQUEST_HEADER % (self.admin_url, table),
+            "url": generate_dms_request_url(DMSREQUEST_HEADER, self.admin_url, table),
             "include": include,
             "exclude": exclude,
             "filter": filter,
             "query_time": time.time()-start_time,
-            "data": rows
+            "data": table_rows
         }
